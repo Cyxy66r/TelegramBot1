@@ -1,0 +1,1366 @@
+name: 🖥️ RDP + Multi-Bot Host (Dashboard + DB)
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duration (minutes)'
+        required: false
+        default: '360'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '360'
+          - '720'
+      bot_tokens:
+        description: 'Bot Tokens (comma separated)'
+        required: false
+        default: ''
+        type: string
+      bot_names:
+        description: 'Bot Names (comma separated, optional)'
+        required: false
+        default: ''
+        type: string
+      persist_data:
+        description: 'Persist Data'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      auto_restart:
+        description: 'Auto-restart on crash'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      web_port:
+        description: 'Web Dashboard Port'
+        required: false
+        default: '5000'
+        type: string
+
+jobs:
+  rdp-dashboard-bot:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(inputs.duration || 360) }}
+    
+    steps:
+      # ============================================================
+      # 1. PERSISTENT STORAGE
+      # ============================================================
+      - name: Setup Storage
+        if: inputs.persist_data == 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\Persistent
+          New-Item -ItemType Directory -Force -Path C:\Bots
+          New-Item -ItemType Directory -Force -Path C:\Dashboard
+          New-Item -ItemType Directory -Force -Path C:\Database
+          New-Item -ItemType SymbolicLink -Path "C:\Users\Public\Desktop\Persistent" -Target C:\Persistent -Force
+          New-Item -ItemType SymbolicLink -Path "C:\Users\Public\Desktop\Bots" -Target C:\Bots -Force
+          New-Item -ItemType SymbolicLink -Path "C:\Users\Public\Desktop\Dashboard" -Target C:\Dashboard -Force
+          echo "✅ Storage ready"
+
+      # ============================================================
+      # 2. RDP CONFIG
+      # ============================================================
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Ultimate" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Ultimate" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="Dashboard" dir=in action=allow protocol=TCP localport=${{ inputs.web_port }}
+          Restart-Service -Name TermService -Force
+
+      # ============================================================
+      # 3. CREATE USER
+      # ============================================================
+      - name: Create RDP User
+        run: |
+          $password = -join ((65..90) + (97..122) + (48..57) + (33..47) + (58..64) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Admin" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Admin"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Admin"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 4. TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\tailscale.msi`"", "/quiet", "/norestart" -Wait
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-dash-$env:GITHUB_RUN_ID
+          Start-Sleep -Seconds 10
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 5. INSTALL PYTHON & DEPS
+      # ============================================================
+      - name: Install Python
+        run: |
+          $url = "https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\python.exe"
+          Start-Process -FilePath "$env:TEMP\python.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait
+
+      - name: Install Dependencies
+        if: inputs.bot_tokens != ''
+        run: |
+          pip install python-telegram-bot requests flask aiohttp aiofiles schedule psutil sqlite3 flask-cors markdown
+
+      # ============================================================
+      # 6. SETUP SQLITE DATABASE
+      # ============================================================
+      - name: Setup Database
+        if: inputs.bot_tokens != ''
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\Database
+          
+          @"
+      -- ============================================================
+      -- BOT DATABASE SCHEMA
+      -- ============================================================
+      
+      -- Users table
+      CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER UNIQUE NOT NULL,
+          username TEXT,
+          first_name TEXT,
+          last_name TEXT,
+          is_premium INTEGER DEFAULT 0,
+          is_admin INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_active TIMESTAMP
+      );
+      
+      -- Bot sessions table
+      CREATE TABLE IF NOT EXISTS bot_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bot_name TEXT NOT NULL,
+          bot_token TEXT NOT NULL,
+          status TEXT DEFAULT 'stopped',
+          start_time TIMESTAMP,
+          last_heartbeat TIMESTAMP,
+          total_requests INTEGER DEFAULT 0,
+          total_errors INTEGER DEFAULT 0,
+          config TEXT
+      );
+      
+      -- Command logs table
+      CREATE TABLE IF NOT EXISTS command_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bot_name TEXT NOT NULL,
+          user_id INTEGER,
+          command TEXT,
+          response TEXT,
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      -- User data table (custom data per bot)
+      CREATE TABLE IF NOT EXISTS user_data (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bot_name TEXT NOT NULL,
+          user_id INTEGER NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(bot_name, user_id, key)
+      );
+      
+      -- System logs
+      CREATE TABLE IF NOT EXISTS system_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          level TEXT,
+          message TEXT,
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_user_data_bot ON user_data(bot_name, user_id);
+      CREATE INDEX IF NOT EXISTS idx_command_logs_bot ON command_logs(bot_name, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_system_logs_time ON system_logs(timestamp);
+      "@ | Out-File -FilePath "C:\Database\schema.sql" -Encoding UTF8
+          
+          # Initialize database
+          sqlite3 C:\Database\bots.db < C:\Database\schema.sql
+          echo "✅ Database initialized"
+
+      # ============================================================
+      # 7. CREATE WEB DASHBOARD
+      # ============================================================
+      - name: Create Web Dashboard
+        if: inputs.bot_tokens != ''
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\Dashboard
+          New-Item -ItemType Directory -Force -Path C:\Dashboard\templates
+          New-Item -ItemType Directory -Force -Path C:\Dashboard\static
+          
+          # ===== HTML DASHBOARD =====
+          @"
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>🤖 Bot Dashboard</title>
+          <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                  font-family: 'Segoe UI', system-ui, sans-serif;
+                  background: #0b0e14;
+                  color: #e8edf5;
+                  min-height: 100vh;
+                  padding: 20px;
+              }
+              .container { max-width: 1400px; margin: 0 auto; }
+              .header {
+                  display: flex; justify-content: space-between; align-items: center;
+                  background: #131a24; padding: 18px 24px; border-radius: 16px;
+                  border: 1px solid #1e2a36; margin-bottom: 24px;
+              }
+              .logo {
+                  font-size: 24px; font-weight: 700;
+                  background: linear-gradient(135deg, #a855f7, #6366f1);
+                  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+              }
+              .status {
+                  font-size: 13px; color: #8aa0b8;
+                  background: #1a2632; padding: 6px 18px; border-radius: 40px;
+                  border: 1px solid #2a3a4a;
+              }
+              .status .dot {
+                  display: inline-block; width: 8px; height: 8px;
+                  background: #22c55e; border-radius: 50%; margin-right: 8px;
+                  animation: pulse 1.8s infinite;
+              }
+              @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+              
+              .grid {
+                  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                  gap: 16px; margin-bottom: 24px;
+              }
+              .stat-card {
+                  background: #131a24; border-radius: 14px; padding: 16px 20px;
+                  border: 1px solid #1e2a36; text-align: center;
+              }
+              .stat-card .label { font-size: 12px; color: #6b7b8d; text-transform: uppercase; }
+              .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+              .stat-card .value.green { color: #22c55e; }
+              .stat-card .value.blue { color: #3b82f6; }
+              .stat-card .value.purple { color: #a855f7; }
+              .stat-card .value.gold { color: #f59e0b; }
+              .stat-card .value.red { color: #ef4444; }
+              
+              .panel {
+                  background: #131a24; border-radius: 14px;
+                  border: 1px solid #1e2a36; padding: 20px;
+                  margin-bottom: 20px;
+              }
+              .panel-title { font-size: 16px; font-weight: 600; margin-bottom: 14px; color: #b0c4db; }
+              
+              table {
+                  width: 100%; border-collapse: collapse; font-size: 14px;
+              }
+              th, td {
+                  padding: 10px 14px; text-align: left;
+                  border-bottom: 1px solid #1e2a36;
+              }
+              th { color: #6b7b8d; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+              tr:hover { background: #0b0e14; }
+              
+              .badge {
+                  display: inline-block; padding: 2px 12px; border-radius: 20px;
+                  font-size: 12px; font-weight: 500;
+              }
+              .badge.online { background: #22c55e20; color: #22c55e; border: 1px solid #22c55e40; }
+              .badge.offline { background: #ef444420; color: #ef4444; border: 1px solid #ef444440; }
+              .badge.error { background: #f59e0b20; color: #f59e0b; border: 1px solid #f59e0b40; }
+              
+              .btn {
+                  padding: 6px 14px; border: none; border-radius: 8px;
+                  font-weight: 500; font-size: 12px; cursor: pointer;
+                  transition: 0.2s;
+              }
+              .btn-primary { background: #6366f1; color: #fff; }
+              .btn-primary:hover { background: #4f52e0; }
+              .btn-danger { background: #ef4444; color: #fff; }
+              .btn-danger:hover { background: #dc2626; }
+              .btn-success { background: #22c55e; color: #fff; }
+              .btn-success:hover { background: #16a34a; }
+              .btn-sm { padding: 4px 10px; font-size: 11px; }
+              
+              .refresh-btn {
+                  background: #1a2632; border: 1px solid #2a3a4a;
+                  color: #b0c4db; padding: 6px 16px; border-radius: 8px;
+                  cursor: pointer;
+              }
+              .refresh-btn:hover { border-color: #4a5a6a; }
+              
+              .flex { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+              .flex-between { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+              
+              .log-box {
+                  background: #0b0e14; border-radius: 10px; padding: 12px 16px;
+                  max-height: 300px; overflow-y: auto;
+                  font-family: monospace; font-size: 12px; color: #8aa0b8;
+                  line-height: 1.8;
+              }
+              .log-box .info { color: #3b82f6; }
+              .log-box .success { color: #22c55e; }
+              .log-box .error { color: #ef4444; }
+              .log-box .warn { color: #f59e0b; }
+              
+              ::-webkit-scrollbar { width: 5px; }
+              ::-webkit-scrollbar-track { background: #0b0e14; }
+              ::-webkit-scrollbar-thumb { background: #1e2a36; border-radius: 10px; }
+              
+              @media (max-width: 600px) {
+                  .grid { grid-template-columns: 1fr 1fr; }
+                  .header { flex-direction: column; align-items: flex-start; gap: 10px; }
+              }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <!-- Header -->
+              <div class="header">
+                  <div class="logo">🤖 Bot Dashboard</div>
+                  <div class="status">
+                      <span class="dot"></span> Live &nbsp;|&nbsp;
+                      <span id="lastUpdate">Updating...</span>
+                  </div>
+              </div>
+              
+              <!-- Stats -->
+              <div class="grid" id="statsGrid">
+                  <div class="stat-card">
+                      <div class="label">Total Bots</div>
+                      <div class="value blue" id="statBots">0</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="label">Online</div>
+                      <div class="value green" id="statOnline">0</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="label">Total Users</div>
+                      <div class="value purple" id="statUsers">0</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="label">Total Requests</div>
+                      <div class="value gold" id="statRequests">0</div>
+                  </div>
+                  <div class="stat-card">
+                      <div class="label">Errors</div>
+                      <div class="value red" id="statErrors">0</div>
+                  </div>
+              </div>
+              
+              <!-- Controls -->
+              <div class="panel">
+                  <div class="flex-between">
+                      <div class="panel-title">🤖 Bot Controls</div>
+                      <div class="flex">
+                          <button class="refresh-btn" onclick="refreshAll()">🔄 Refresh</button>
+                          <button class="btn btn-primary" onclick="restartAll()">Restart All</button>
+                          <button class="btn btn-danger" onclick="stopAll()">Stop All</button>
+                      </div>
+                  </div>
+              </div>
+              
+              <!-- Bot List -->
+              <div class="panel">
+                  <div class="panel-title">📋 Bot List</div>
+                  <div style="overflow-x:auto;">
+                      <table>
+                          <thead>
+                              <tr>
+                                  <th>Bot Name</th>
+                                  <th>Status</th>
+                                  <th>Uptime</th>
+                                  <th>Requests</th>
+                                  <th>Users</th>
+                                  <th>Actions</th>
+                              </tr>
+                          </thead>
+                          <tbody id="botTableBody">
+                              <tr><td colspan="6" style="text-align:center;color:#6b7b8d;">Loading bots...</td></tr>
+                          </tbody>
+                      </table>
+                  </div>
+              </div>
+              
+              <!-- Recent Commands -->
+              <div class="panel">
+                  <div class="flex-between">
+                      <div class="panel-title">📝 Recent Commands</div>
+                      <button class="refresh-btn" onclick="refreshCommands()">🔄 Refresh</button>
+                  </div>
+                  <div style="overflow-x:auto;">
+                      <table>
+                          <thead>
+                              <tr>
+                                  <th>Time</th>
+                                  <th>Bot</th>
+                                  <th>User</th>
+                                  <th>Command</th>
+                                  <th>Response</th>
+                              </tr>
+                          </thead>
+                          <tbody id="commandsTableBody">
+                              <tr><td colspan="5" style="text-align:center;color:#6b7b8d;">No commands yet</td></tr>
+                          </tbody>
+                      </table>
+                  </div>
+              </div>
+              
+              <!-- Logs -->
+              <div class="panel">
+                  <div class="flex-between">
+                      <div class="panel-title">📜 System Logs</div>
+                      <button class="refresh-btn" onclick="refreshLogs()">🔄 Refresh</button>
+                  </div>
+                  <div class="log-box" id="logBox">Waiting for logs...</div>
+              </div>
+          </div>
+          
+          <script>
+              // ============================================================
+              // API ENDPOINTS
+              // ============================================================
+              const API_BASE = '/api';
+              
+              async function fetchAPI(endpoint) {
+                  try {
+                      const res = await fetch(`${API_BASE}${endpoint}`);
+                      return await res.json();
+                  } catch (e) {
+                      console.error('API Error:', e);
+                      return { error: e.message };
+                  }
+              }
+              
+              // ============================================================
+              // REFRESH FUNCTIONS
+              // ============================================================
+              async function refreshAll() {
+                  await Promise.all([refreshStats(), refreshBots(), refreshCommands(), refreshLogs()]);
+                  document.getElementById('lastUpdate').textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+              }
+              
+              async function refreshStats() {
+                  const data = await fetchAPI('/stats');
+                  if (!data.error) {
+                      document.getElementById('statBots').textContent = data.total_bots || 0;
+                      document.getElementById('statOnline').textContent = data.online_bots || 0;
+                      document.getElementById('statUsers').textContent = data.total_users || 0;
+                      document.getElementById('statRequests').textContent = data.total_requests || 0;
+                      document.getElementById('statErrors').textContent = data.total_errors || 0;
+                  }
+              }
+              
+              async function refreshBots() {
+                  const data = await fetchAPI('/bots');
+                  const tbody = document.getElementById('botTableBody');
+                  
+                  if (!data.bots || data.bots.length === 0) {
+                      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#6b7b8d;">No bots configured</td></tr>';
+                      return;
+                  }
+                  
+                  tbody.innerHTML = data.bots.map(bot => {
+                      const statusClass = bot.status === 'running' ? 'online' : bot.status === 'error' ? 'error' : 'offline';
+                      const statusText = bot.status === 'running' ? '🟢 Online' : bot.status === 'error' ? '🟡 Error' : '🔴 Offline';
+                      const uptime = bot.uptime || 'N/A';
+                      
+                      return `
+                          <tr>
+                              <td><strong>${bot.name}</strong></td>
+                              <td><span class="badge ${statusClass}">${statusText}</span></td>
+                              <td>${uptime}</td>
+                              <td>${bot.requests || 0}</td>
+                              <td>${bot.users || 0}</td>
+                              <td>
+                                  <button class="btn btn-success btn-sm" onclick="restartBot('${bot.name}')">Restart</button>
+                                  <button class="btn btn-danger btn-sm" onclick="stopBot('${bot.name}')">Stop</button>
+                              </td>
+                          </tr>
+                      `;
+                  }).join('');
+              }
+              
+              async function refreshCommands() {
+                  const data = await fetchAPI('/commands');
+                  const tbody = document.getElementById('commandsTableBody');
+                  
+                  if (!data.commands || data.commands.length === 0) {
+                      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#6b7b8d;">No commands yet</td></tr>';
+                      return;
+                  }
+                  
+                  tbody.innerHTML = data.commands.slice(0, 20).map(cmd => `
+                      <tr>
+                          <td style="font-size:12px;color:#6b7b8d;">${cmd.timestamp}</td>
+                          <td><strong>${cmd.bot}</strong></td>
+                          <td>${cmd.user || 'N/A'}</td>
+                          <td><code style="background:#1a2632;padding:2px 8px;border-radius:4px;">${cmd.command}</code></td>
+                          <td style="font-size:13px;color:#8aa0b8;">${cmd.response || '-'}</td>
+                      </tr>
+                  `).join('');
+              }
+              
+              async function refreshLogs() {
+                  const data = await fetchAPI('/logs');
+                  const logBox = document.getElementById('logBox');
+                  
+                  if (!data.logs || data.logs.length === 0) {
+                      logBox.textContent = 'No logs available';
+                      return;
+                  }
+                  
+                  logBox.innerHTML = data.logs.slice(-30).map(log => {
+                      const levelClass = log.level === 'INFO' ? 'info' : log.level === 'SUCCESS' ? 'success' : log.level === 'ERROR' ? 'error' : 'warn';
+                      return `<div class="${levelClass}">[${log.timestamp}] ${log.message}</div>`;
+                  }).join('');
+              }
+              
+              // ============================================================
+              // ACTIONS
+              // ============================================================
+              async function restartBot(name) {
+                  if (!confirm(`Restart bot: ${name}?`)) return;
+                  const data = await fetchAPI(`/bot/${name}/restart`, { method: 'POST' });
+                  alert(data.message || 'Restart triggered');
+                  refreshAll();
+              }
+              
+              async function stopBot(name) {
+                  if (!confirm(`Stop bot: ${name}?`)) return;
+                  const data = await fetchAPI(`/bot/${name}/stop`, { method: 'POST' });
+                  alert(data.message || 'Stop triggered');
+                  refreshAll();
+              }
+              
+              async function restartAll() {
+                  if (!confirm('Restart ALL bots?')) return;
+                  const data = await fetchAPI('/bots/restart', { method: 'POST' });
+                  alert(data.message || 'Restarting all bots...');
+                  refreshAll();
+              }
+              
+              async function stopAll() {
+                  if (!confirm('Stop ALL bots?')) return;
+                  const data = await fetchAPI('/bots/stop', { method: 'POST' });
+                  alert(data.message || 'Stopping all bots...');
+                  refreshAll();
+              }
+              
+              // ============================================================
+              // AUTO REFRESH
+              // ============================================================
+              refreshAll();
+              setInterval(refreshAll, 5000);
+          </script>
+      </body>
+      </html>
+      "@ | Out-File -FilePath "C:\Dashboard\templates\index.html" -Encoding UTF8
+
+      # ============================================================
+      # 8. CREATE FLASK API SERVER
+      # ============================================================
+      - name: Create Flask API Server
+        if: inputs.bot_tokens != ''
+        run: |
+          @"
+      # ============================================================
+      # FLASK API SERVER WITH DATABASE
+      # ============================================================
+      import os
+      import sys
+      import json
+      import sqlite3
+      import subprocess
+      import psutil
+      import time
+      from datetime import datetime, timedelta
+      from flask import Flask, request, jsonify, render_template
+      from flask_cors import CORS
+      import logging
+      
+      # Setup logging
+      logging.basicConfig(level=logging.INFO)
+      logger = logging.getLogger(__name__)
+      
+      app = Flask(__name__, template_folder='templates', static_folder='static')
+      CORS(app)
+      
+      # Database path
+      DB_PATH = r"C:\Database\bots.db"
+      BOTS_PATH = r"C:\Bots"
+      
+      # ============================================================
+      # DATABASE HELPERS
+      # ============================================================
+      def get_db():
+          conn = sqlite3.connect(DB_PATH)
+          conn.row_factory = sqlite3.Row
+          return conn
+      
+      def query_db(query, params=(), fetch_one=False, fetch_all=False):
+          conn = get_db()
+          cursor = conn.cursor()
+          cursor.execute(query, params)
+          if fetch_one:
+              result = cursor.fetchone()
+          elif fetch_all:
+              result = cursor.fetchall()
+          else:
+              result = None
+          conn.commit()
+          conn.close()
+          return result
+      
+      # ============================================================
+      # API ENDPOINTS
+      # ============================================================
+      
+      @app.route('/')
+      def index():
+          return render_template('index.html')
+      
+      @app.route('/api/stats')
+      def api_stats():
+          try:
+              # Get bot status from database
+              bots = query_db("SELECT name, status, total_requests, total_errors FROM bot_sessions", fetch_all=True)
+              total_bots = len(bots) if bots else 0
+              online_bots = sum(1 for b in bots if b and b['status'] == 'running') if bots else 0
+              total_requests = sum(b['total_requests'] for b in bots) if bots else 0
+              total_errors = sum(b['total_errors'] for b in bots) if bots else 0
+              
+              # Get total users
+              users = query_db("SELECT COUNT(*) as count FROM users", fetch_one=True)
+              total_users = users['count'] if users else 0
+              
+              return jsonify({
+                  'total_bots': total_bots,
+                  'online_bots': online_bots,
+                  'total_users': total_users,
+                  'total_requests': total_requests,
+                  'total_errors': total_errors
+              })
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/bots')
+      def api_bots():
+          try:
+              bots = query_db("SELECT * FROM bot_sessions", fetch_all=True)
+              result = []
+              
+              if bots:
+                  for bot in bots:
+                      # Calculate uptime
+                      uptime = 'N/A'
+                      if bot['start_time']:
+                          start = datetime.fromisoformat(bot['start_time'])
+                          elapsed = datetime.now() - start
+                          hours, remainder = divmod(elapsed.total_seconds(), 3600)
+                          minutes, seconds = divmod(remainder, 60)
+                          uptime = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+                      
+                      # Get user count for this bot
+                      users = query_db("SELECT COUNT(DISTINCT user_id) as count FROM command_logs WHERE bot_name = ?", (bot['name'],), fetch_one=True)
+                      user_count = users['count'] if users else 0
+                      
+                      result.append({
+                          'name': bot['name'],
+                          'status': bot['status'],
+                          'uptime': uptime,
+                          'requests': bot['total_requests'] or 0,
+                          'users': user_count,
+                          'errors': bot['total_errors'] or 0
+                      })
+              
+              return jsonify({'bots': result})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/commands')
+      def api_commands():
+          try:
+              limit = request.args.get('limit', 50, type=int)
+              logs = query_db(
+                  "SELECT * FROM command_logs ORDER BY timestamp DESC LIMIT ?",
+                  (limit,), fetch_all=True
+              )
+              
+              commands = []
+              if logs:
+                  for log in logs:
+                      commands.append({
+                          'timestamp': log['timestamp'],
+                          'bot': log['bot_name'],
+                          'user': log['user_id'],
+                          'command': log['command'],
+                          'response': log['response'][:100] if log['response'] else ''
+                      })
+              
+              return jsonify({'commands': commands})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/logs')
+      def api_logs():
+          try:
+              limit = request.args.get('limit', 50, type=int)
+              logs = query_db(
+                  "SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT ?",
+                  (limit,), fetch_all=True
+              )
+              
+              result = []
+              if logs:
+                  for log in logs:
+                      result.append({
+                          'timestamp': log['timestamp'],
+                          'level': log['level'],
+                          'message': log['message']
+                      })
+              
+              return jsonify({'logs': result})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/bot/<name>/restart', methods=['POST'])
+      def api_restart_bot(name):
+          try:
+              # Kill existing process
+              for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                  try:
+                      if proc.info['name'] == 'python.exe':
+                          cmdline = ' '.join(proc.info['cmdline'] or [])
+                          if name in cmdline:
+                              proc.kill()
+                  except:
+                      pass
+              
+              # Start new process
+              bot_path = os.path.join(BOTS_PATH, name)
+              bot_file = os.path.join(bot_path, 'bot.py')
+              
+              if os.path.exists(bot_file):
+                  subprocess.Popen(['python', bot_file], cwd=bot_path, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                  query_db("UPDATE bot_sessions SET status = 'running', start_time = ? WHERE name = ?", (datetime.now().isoformat(), name))
+                  return jsonify({'status': 'success', 'message': f'Bot {name} restarted'})
+              else:
+                  return jsonify({'status': 'error', 'message': 'Bot file not found'}), 404
+                  
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/bot/<name>/stop', methods=['POST'])
+      def api_stop_bot(name):
+          try:
+              for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                  try:
+                      if proc.info['name'] == 'python.exe':
+                          cmdline = ' '.join(proc.info['cmdline'] or [])
+                          if name in cmdline:
+                              proc.kill()
+                  except:
+                      pass
+              
+              query_db("UPDATE bot_sessions SET status = 'stopped' WHERE name = ?", (name,))
+              return jsonify({'status': 'success', 'message': f'Bot {name} stopped'})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/bots/restart', methods=['POST'])
+      def api_restart_all():
+          try:
+              bots = query_db("SELECT name FROM bot_sessions", fetch_all=True)
+              if bots:
+                  for bot in bots:
+                      name = bot['name']
+                      bot_path = os.path.join(BOTS_PATH, name)
+                      bot_file = os.path.join(bot_path, 'bot.py')
+                      if os.path.exists(bot_file):
+                          subprocess.Popen(['python', bot_file], cwd=bot_path, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                          query_db("UPDATE bot_sessions SET status = 'running' WHERE name = ?", (name,))
+              return jsonify({'status': 'success', 'message': 'All bots restarted'})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      @app.route('/api/bots/stop', methods=['POST'])
+      def api_stop_all():
+          try:
+              for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                  try:
+                      if proc.info['name'] == 'python.exe':
+                          proc.kill()
+                  except:
+                      pass
+              query_db("UPDATE bot_sessions SET status = 'stopped'", ())
+              return jsonify({'status': 'success', 'message': 'All bots stopped'})
+          except Exception as e:
+              return jsonify({'error': str(e)}), 500
+      
+      # ============================================================
+      # MAIN
+      # ============================================================
+      if __name__ == '__main__':
+          port = int(os.environ.get('PORT', 5000))
+          app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+      "@ | Out-File -FilePath "C:\Dashboard\app.py" -Encoding UTF8
+
+      # ============================================================
+      # 9. CREATE BOT WITH DATABASE INTEGRATION
+      # ============================================================
+      - name: Create Bot Template with DB
+        if: inputs.bot_tokens != ''
+        run: |
+          # Parse tokens and names
+          $tokens = "${{ inputs.bot_tokens }}".Split(',') | ForEach-Object { $_.Trim() }
+          $names = "${{ inputs.bot_names }}".Split(',') | ForEach-Object { $_.Trim() }
+          
+          $botIndex = 0
+          foreach ($token in $tokens) {
+            if ($token -eq '') { continue }
+            
+            $botName = if ($botIndex -lt $names.Count -and $names[$botIndex] -ne '') { $names[$botIndex] } else { "Bot_$botIndex" }
+            $botPath = "C:\Bots\$botName"
+            New-Item -ItemType Directory -Force -Path $botPath
+            
+            @"
+      # ============================================================
+      # BOT WITH DATABASE INTEGRATION
+      # ============================================================
+      import asyncio
+      import logging
+      import sqlite3
+      import time
+      import sys
+      import os
+      from datetime import datetime
+      from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+      from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+      
+      # Setup logging
+      logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+      logger = logging.getLogger(__name__)
+      
+      # Bot config
+      BOT_TOKEN = "$token"
+      BOT_NAME = "$botName"
+      DB_PATH = r"C:\Database\bots.db"
+      
+      # ============================================================
+      # DATABASE HELPERS
+      # ============================================================
+      def get_db():
+          conn = sqlite3.connect(DB_PATH)
+          conn.row_factory = sqlite3.Row
+          return conn
+      
+      def log_command(user_id, command, response):
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "INSERT INTO command_logs (bot_name, user_id, command, response) VALUES (?, ?, ?, ?)",
+                  (BOT_NAME, user_id, command, response[:500] if response else '')
+              )
+              conn.commit()
+              conn.close()
+          except Exception as e:
+              logger.error(f"DB log error: {e}")
+      
+      def log_system(level, message):
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "INSERT INTO system_logs (level, message) VALUES (?, ?)",
+                  (level, message)
+              )
+              conn.commit()
+              conn.close()
+          except Exception as e:
+              pass
+      
+      def get_user(user_id, username=None, first_name=None, last_name=None):
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "SELECT * FROM users WHERE user_id = ?",
+                  (user_id,)
+              )
+              user = cursor.fetchone()
+              if not user:
+                  cursor.execute(
+                      "INSERT INTO users (user_id, username, first_name, last_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                      (user_id, username, first_name, last_name, datetime.now().isoformat())
+                  )
+                  conn.commit()
+              else:
+                  cursor.execute(
+                      "UPDATE users SET last_active = ? WHERE user_id = ?",
+                      (datetime.now().isoformat(), user_id)
+                  )
+                  conn.commit()
+              conn.close()
+              return True
+          except Exception as e:
+              logger.error(f"User DB error: {e}")
+              return False
+      
+      def get_bot_stats():
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "SELECT COUNT(DISTINCT user_id) as users, COUNT(*) as total FROM command_logs WHERE bot_name = ?",
+                  (BOT_NAME,)
+              )
+              stats = cursor.fetchone()
+              conn.close()
+              return stats
+          except:
+              return {'users': 0, 'total': 0}
+      
+      def update_bot_status(status, error_count=0):
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "INSERT OR REPLACE INTO bot_sessions (bot_name, bot_token, status, start_time, total_errors) VALUES (?, ?, ?, ?, ?)",
+                  (BOT_NAME, BOT_TOKEN, status, datetime.now().isoformat(), error_count)
+              )
+              conn.commit()
+              conn.close()
+          except Exception as e:
+              logger.error(f"Status update error: {e}")
+      
+      # ============================================================
+      # COMMAND HANDLERS
+      # ============================================================
+      
+      async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          user = update.effective_user
+          get_user(user.id, user.username, user.first_name, user.last_name)
+          
+          keyboard = [
+              [InlineKeyboardButton("📊 Status", callback_data="status")],
+              [InlineKeyboardButton("🕒 Uptime", callback_data="uptime")],
+              [InlineKeyboardButton("📈 Stats", callback_data="stats")],
+              [InlineKeyboardButton("ℹ️ Info", callback_data="info")],
+          ]
+          reply_markup = InlineKeyboardMarkup(keyboard)
+          
+          message = f"🤖 **{BOT_NAME} is Alive!**\\n\\n✅ Running on free RDP\\n🖥️ Host: GitHub Actions\\n📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\nUse /help for commands"
+          
+          await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+          log_command(user.id, '/start', 'Menu shown')
+          log_system('INFO', f'User {user.id} started bot')
+      
+      async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          help_text = '''
+      🤖 **Available Commands:**
+      
+      /start - Show menu
+      /ping - Check if bot is alive
+      /status - Show bot status
+      /uptime - Show uptime
+      /stats - Show bot statistics
+      /info - System info
+      /echo <text> - Echo message
+      /save <key> <value> - Save data
+      /get <key> - Retrieve data
+      '''
+          await update.message.reply_text(help_text, parse_mode='Markdown')
+          log_command(update.effective_user.id, '/help', 'Help shown')
+      
+      async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          await update.message.reply_text("🏓 **Pong!**\\n\\nBot is alive and responding!", parse_mode='Markdown')
+          log_command(update.effective_user.id, '/ping', 'Pong')
+      
+      async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          import psutil
+          cpu = psutil.cpu_percent()
+          memory = psutil.virtual_memory()
+          
+          status_text = f'''
+      📊 **Bot Status**
+      
+      ✅ Status: Online
+      🤖 Bot: {BOT_NAME}
+      🖥️ Host: GitHub Actions RDP
+      🐍 Python: {sys.version.split()[0]}
+      💻 CPU: {cpu}%
+      🧠 Memory: {memory.used // (1024**2)}MB / {memory.total // (1024**2)}MB
+      📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+      👤 User ID: {update.effective_user.id}
+      '''
+          await update.message.reply_text(status_text, parse_mode='Markdown')
+          log_command(update.effective_user.id, '/status', 'Status shown')
+      
+      async def uptime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          uptime_seconds = int(time.time() - context.bot_data.get('start_time', time.time()))
+          hours = uptime_seconds // 3600
+          minutes = (uptime_seconds % 3600) // 60
+          seconds = uptime_seconds % 60
+          await update.message.reply_text(f"🕒 **Uptime:** {hours}h {minutes}m {seconds}s", parse_mode='Markdown')
+          log_command(update.effective_user.id, '/uptime', f'{hours}h {minutes}m')
+      
+      async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          stats = get_bot_stats()
+          stats_text = f'''
+      📈 **Bot Statistics**
+      
+      🤖 Bot: {BOT_NAME}
+      👥 Total Users: {stats['users'] if stats else 0}
+      📝 Total Commands: {stats['total'] if stats else 0}
+      '''
+          await update.message.reply_text(stats_text, parse_mode='Markdown')
+          log_command(update.effective_user.id, '/stats', 'Stats shown')
+      
+      async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          info_text = f'''
+      📋 **System Info**
+      
+      🤖 Bot: {BOT_NAME}
+      💻 OS: Windows Server
+      🐍 Python: {sys.version.split()[0]}
+      📁 Bot Path: C:\\\\Bots\\\\{BOT_NAME}
+      📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+      👤 User ID: {update.effective_user.id}
+      '''
+          await update.message.reply_text(info_text, parse_mode='Markdown')
+          log_command(update.effective_user.id, '/info', 'Info shown')
+      
+      async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          text = ' '.join(context.args)
+          if text:
+              await update.message.reply_text(f"🔊 **Echo:** {text}", parse_mode='Markdown')
+              log_command(update.effective_user.id, '/echo', text[:100])
+          else:
+              await update.message.reply_text("❌ Please provide text to echo. Example: `/echo Hello`", parse_mode='Markdown')
+      
+      # ============================================================
+      # USER DATA STORAGE (KEY-VALUE)
+      # ============================================================
+      
+      async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          args = context.args
+          if len(args) < 2:
+              await update.message.reply_text("❌ Usage: `/save key value`", parse_mode='Markdown')
+              return
+          
+          key = args[0]
+          value = ' '.join(args[1:])
+          user_id = update.effective_user.id
+          
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "INSERT OR REPLACE INTO user_data (bot_name, user_id, key, value, updated_at) VALUES (?, ?, ?, ?, ?)",
+                  (BOT_NAME, user_id, key, value, datetime.now().isoformat())
+              )
+              conn.commit()
+              conn.close()
+              await update.message.reply_text(f"✅ Saved: `{key}` = `{value}`", parse_mode='Markdown')
+              log_command(user_id, '/save', f'{key}={value}')
+          except Exception as e:
+              await update.message.reply_text(f"❌ Error: {e}")
+      
+      async def get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          if not context.args:
+              await update.message.reply_text("❌ Usage: `/get key`", parse_mode='Markdown')
+              return
+          
+          key = context.args[0]
+          user_id = update.effective_user.id
+          
+          try:
+              conn = get_db()
+              cursor = conn.cursor()
+              cursor.execute(
+                  "SELECT value FROM user_data WHERE bot_name = ? AND user_id = ? AND key = ?",
+                  (BOT_NAME, user_id, key)
+              )
+              row = cursor.fetchone()
+              conn.close()
+              
+              if row:
+                  await update.message.reply_text(f"📂 `{key}` = `{row['value']}`", parse_mode='Markdown')
+              else:
+                  await update.message.reply_text(f"❌ Key `{key}` not found", parse_mode='Markdown')
+              
+              log_command(user_id, '/get', key)
+          except Exception as e:
+              await update.message.reply_text(f"❌ Error: {e}")
+      
+      # ============================================================
+      # CALLBACK HANDLERS
+      # ============================================================
+      
+      async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+          query = update.callback_query
+          await query.answer()
+          
+          if query.data == "status":
+              await status_cmd(update, context)
+          elif query.data == "uptime":
+              await uptime(update, context)
+          elif query.data == "stats":
+              await stats(update, context)
+          elif query.data == "info":
+              await info(update, context)
+      
+      # ============================================================
+      # ERROR HANDLER
+      # ============================================================
+      
+      async def error_handler(update, context):
+          logger.error(f"Update {update} caused error {context.error}")
+          log_system('ERROR', f"Bot error: {context.error}")
+          try:
+              await update.message.reply_text("⚠️ An error occurred. Please try again later.")
+          except:
+              pass
+      
+      # ============================================================
+      # MAIN
+      # ============================================================
+      
+      async def main():
+          app = ApplicationBuilder().token(BOT_TOKEN).build()
+          
+          # Store start time
+          app.bot_data['start_time'] = time.time()
+          
+          # Update bot status
+          update_bot_status('running')
+          log_system('INFO', f'Bot {BOT_NAME} started successfully')
+          
+          # Add handlers
+          app.add_handler(CommandHandler("start", start))
+          app.add_handler(CommandHandler("help", help_cmd))
+          app.add_handler(CommandHandler("ping", ping))
+          app.add_handler(CommandHandler("status", status_cmd))
+          app.add_handler(CommandHandler("uptime", uptime))
+          app.add_handler(CommandHandler("stats", stats))
+          app.add_handler(CommandHandler("info", info))
+          app.add_handler(CommandHandler("echo", echo))
+          app.add_handler(CommandHandler("save", save))
+          app.add_handler(CommandHandler("get", get))
+          app.add_handler(CallbackQueryHandler(button_callback))
+          app.add_error_handler(error_handler)
+          
+          logger.info(f"🤖 {BOT_NAME} started successfully!")
+          print(f"✅ {BOT_NAME} is running!")
+          
+          await app.run_polling()
+      
+      if __name__ == "__main__":
+          asyncio.run(main())
+      "@ | Out-File -FilePath "$botPath\bot.py" -Encoding UTF8
+            
+            # Register bot in database
+            sqlite3 C:\Database\bots.db "INSERT OR REPLACE INTO bot_sessions (bot_name, bot_token, status) VALUES ('$botName', '$token', 'stopped');"
+            
+            Write-Host "✅ Bot '$botName' created at $botPath"
+            $botIndex++
+          }
+          
+          echo "BOT_COUNT=$botIndex" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 10. START EVERYTHING
+      # ============================================================
+      - name: Start Services
+        if: inputs.bot_tokens != ''
+        run: |
+          # Start all bots
+          for ($i = 0; $i -lt [int]$env:BOT_COUNT; $i++) {
+            $botName = if ($i -lt $names.Count -and $names[$i] -ne '') { $names[$i] } else { "Bot_$i" }
+            $botPath = "C:\Bots\$botName"
+            if (Test-Path "$botPath\bot.py") {
+              Start-Process -FilePath "python" -ArgumentList "$botPath\bot.py" -NoNewWindow
+              Start-Sleep -Seconds 2
+            }
+          }
+          
+          # Start dashboard
+          Start-Process -FilePath "python" -ArgumentList "C:\Dashboard\app.py" -NoNewWindow
+          
+          Start-Sleep -Seconds 5
+          echo "✅ All services started!"
+
+      # ============================================================
+      # 11. INSTALL TOOLS
+      # ============================================================
+      - name: Install Tools
+        run: |
+          $url = "https://www.7-zip.org/a/7z2409-x64.msi"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\7zip.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\7zip.msi`"", "/quiet", "/norestart" -Wait
+          
+          $url = "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.7.1/npp.8.7.1.Installer.x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\npp.exe"
+          Start-Process -FilePath "$env:TEMP\npp.exe" -ArgumentList "/S" -Wait
+          
+          # SQLite browser
+          $url = "https://sqlitebrowser.org/dl/DB.Browser.for.SQLite-3.12.2-win64.msi"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\sqlitebrowser.msi"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\sqlitebrowser.msi`"", "/quiet", "/norestart" -Wait
+          
+          echo "✅ Tools installed"
+
+      # ============================================================
+      # 12. CREATE SHORTCUTS
+      # ============================================================
+      - name: Create Shortcuts
+        run: |
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          
+          # Dashboard shortcut
+          $shortcut = "$desktop\Dashboard.lnk"
+          $shell = New-Object -ComObject WScript.Shell
+          $link = $shell.CreateShortcut($shortcut)
+          $link.TargetPath = "http://localhost:${{ inputs.web_port }}"
+          $link.Save()
+          
+          # Database shortcut
+          $shortcut = "$desktop\Database.lnk"
+          $link = $shell.CreateShortcut($shortcut)
+          $link.TargetPath = "C:\Database"
+          $link.Save()
+          
+          # Restart scripts
+          @"
+      @echo off
+      echo Restarting all bots...
+      for /d %%i in (C:\Bots\Bot_*) do (
+        cd %%i
+        start /B python bot.py
+      )
+      echo Dashboard restarting...
+      taskkill /F /IM python.exe /FI "WINDOWTITLE eq Dashboard"
+      cd C:\Dashboard
+      start /B python app.py
+      echo All services restarted!
+      pause
+      "@ | Out-File -FilePath "C:\restart_all.bat" -Encoding ASCII
+          
+          echo "✅ Shortcuts created"
+
+      # ============================================================
+      # 13. DISPLAY ACCESS
+      # ============================================================
+      - name: Show Access
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $password = $env:RDP_PASSWORD
+          $port = "${{ inputs.web_port }}"
+          $botCount = [int]$env:BOT_COUNT
+          
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          Write-Host "║        🖥️  RDP + MULTI-BOT + DASHBOARD + DATABASE  🖥️                          ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════════════════════════╣"
+          Write-Host "║                                                                                  ║"
+          Write-Host "║  📍 RDP:   $ip                                               ║"
+          Write-Host "║  👤 User:  Admin                                              ║"
+          Write-Host "║  🔑 Pass:  $password                                          ║"
+          Write-Host "║                                                                                  ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════════════════════════╣"
+          Write-Host "║  🌐 DASHBOARD: http://$ip`:$port                           ║"
+          Write-Host "║  🤖 Bots:    $botCount running                                                ║"
+          Write-Host "║  📁 DB:      C:\Database\bots.db                                               ║"
+          Write-Host "║  💾 Persist: ${{ inputs.persist_data }}                                       ║"
+          Write-Host "║  ⏱️  Duration: ${{ inputs.duration }} minutes                                 ║"
+          Write-Host "╠══════════════════════════════════════════════════════════════════════════════════╣"
+          Write-Host "║  📌 BOT COMMANDS:                                                               ║"
+          Write-Host "║     /start /ping /status /uptime /stats /info /echo /save /get                  ║"
+          Write-Host "║                                                                                  ║"
+          Write-Host "║  🛠  SCRIPTS:                                                                    ║"
+          Write-Host "║     C:\restart_all.bat - Restart all services                                    ║"
+          Write-Host "║     C:\Dashboard\app.py - Flask API server                                       ║"
+          Write-Host "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          Write-Host ""
+
+      # ============================================================
+      # 14. KEEP ALIVE
+      # ============================================================
+      - name: Keep Alive
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $startTime = Get-Date
+          $duration = ${{ inputs.duration }} * 60
+          
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $remaining = $duration - $elapsed.TotalSeconds
+            
+            if ($remaining -le 0) {
+              Write-Host "⏰ Time limit reached. Shutting down..."
+              break
+            }
+            
+            $hours = [math]::Floor($remaining / 3600)
+            $minutes = [math]::Floor(($remaining % 3600) / 60)
+            $seconds = [math]::Floor($remaining % 60)
+            
+            $botProcesses = Get-Process python -ErrorAction SilentlyContinue
+            $botCount = if ($botProcesses) { $botProcesses.Count } else { 0 }
+            
+            Write-Host "[$(Get-Date)] 🟢 Active | $($hours)h $($minutes)m $($seconds)s | IP: $ip | Processes: $botCount"
+            
+            $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+            if ($tsStatus -match "offline") {
+              Write-Host "⚠️ Tailscale disconnected! Reconnecting..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+            }
+            
+            Start-Sleep -Seconds 60
+          }
+
+      # ============================================================
+      # 15. CLEANUP & BACKUP
+      # ============================================================
+      - name: Cleanup
+        if: always()
+        run: |
+          if (Test-Path C:\Bots) { Compress-Archive -Path C:\Bots\* -DestinationPath C:\bots_backup.zip -Force }
+          if (Test-Path C:\Database) { Compress-Archive -Path C:\Database\* -DestinationPath C:\database_backup.zip -Force }
+          if (Test-Path C:\Dashboard) { Compress-Archive -Path C:\Dashboard\* -DestinationPath C:\dashboard_backup.zip -Force }
+          Remove-Item -Path C:\Users\*\AppData\Local\Temp\* -Recurse -Force -ErrorAction SilentlyContinue
+
+      # ============================================================
+      # 16. UPLOAD BACKUP
+      # ============================================================
+      - name: Upload Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-backup
+          path: |
+            C:\bots_backup.zip
+            C:\database_backup.zip
+            C:\dashboard_backup.zip
+            C:\Database\bots.db
+          retention-days: 7
+          if-no-files-found: ignore
